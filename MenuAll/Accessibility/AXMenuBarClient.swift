@@ -140,6 +140,7 @@ actor AXMenuBarClient {
                     depth: 0,
                     visited: &visited,
                     remainingNodeBudget: &remainingNodeBudget,
+                    clock: clock,
                     deadline: deadline,
                     results: &menuBarItems
                 )
@@ -320,12 +321,13 @@ private extension AXMenuBarClient {
         depth: Int,
         visited: inout Set<CFHashCode>,
         remainingNodeBudget: inout Int,
+        clock: ContinuousClock,
         deadline: ContinuousClock.Instant,
         results: inout [AXUIElement]
     ) {
         guard depth <= 5,
               remainingNodeBudget > 0,
-              ContinuousClock().now < deadline,
+              clock.now < deadline,
               results.count < AXDiscoveryLimits.maximumItemsPerApplication
         else { return }
         remainingNodeBudget -= 1
@@ -343,6 +345,7 @@ private extension AXMenuBarClient {
                 depth: depth + 1,
                 visited: &visited,
                 remainingNodeBudget: &remainingNodeBudget,
+                clock: clock,
                 deadline: deadline,
                 results: &results
             )

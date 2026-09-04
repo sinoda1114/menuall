@@ -78,7 +78,7 @@ xcodebuild test \
 
 ## 現在の検証状況
 
-Unitテスト112件、Debug／Releaseビルド、静的解析、従来範囲のUI E2E、Mac miniでの列挙・元メニュー操作、Iceを一時終了した状態での独立動作は確認済みです。表示／非表示の実変更は安全側の実装とヘッドレス検証まで完了していますが、実項目を動かすE2Eは未実行です。ノッチ付きMacでの検証とDeveloper ID署名・公証も未完了です。詳細は[技術スパイク結果](docs/technical-spike-results.md)を参照してください。
+Unitテスト119件、Debug／Releaseビルド、静的解析、従来範囲のUI E2E、Mac miniでの列挙・元メニュー操作、Iceを一時終了した状態での独立動作は確認済みです。表示／非表示の実変更は安全側の実装とヘッドレス検証まで完了していますが、実項目を動かすE2Eは未実行です。ノッチ付きMacでの検証とDeveloper ID署名・公証も未完了です。詳細は[技術スパイク結果](docs/technical-spike-results.md)を参照してください。
 
 ## ライセンス
 

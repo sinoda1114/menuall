@@ -156,6 +156,7 @@ struct WindowServerMenuBarItemDescriptorProvider: WindowServerMenuBarItemDescrip
         }
 
         let statusLayer = Int(CGWindowLevelForKey(.statusWindow))
+        let displayIDs = activeDisplayIDs()
         return rawWindows.compactMap { rawWindow in
             guard let layer = (rawWindow[kCGWindowLayer as String] as? NSNumber)?.intValue,
                   layer == statusLayer,
@@ -187,13 +188,16 @@ struct WindowServerMenuBarItemDescriptorProvider: WindowServerMenuBarItemDescrip
                 ),
                 layer: layer,
                 frame: frame,
-                displayID: displayID(containing: frame)
+                displayID: displayID(containing: frame, among: displayIDs)
             )
         }
     }
 
-    private func displayID(containing frame: CGRect) -> CGDirectDisplayID? {
-        activeDisplayIDs().first { displayID in
+    private func displayID(
+        containing frame: CGRect,
+        among displayIDs: Set<CGDirectDisplayID>
+    ) -> CGDirectDisplayID? {
+        displayIDs.first { displayID in
             CGDisplayBounds(displayID).contains(CGPoint(x: frame.midX, y: frame.midY))
         }
     }

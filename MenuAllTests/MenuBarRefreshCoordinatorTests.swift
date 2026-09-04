@@ -120,6 +120,142 @@ struct MenuBarRefreshCoordinatorTests {
         #expect(store.lastUpdatedAt != nil)
     }
 
+    @Test("停止時は進行中の更新を待つ呼び出しを解放する")
+    func stopResumesQueuedRefreshWaiters() async {
+        let discovery = FakeMenuBarDiscoveryService(
+            results: [(items: [], failures: [])],
+            suspendsFirstDiscovery: true
+        )
+        let coordinator = MenuBarRefreshCoordinator(
+            store: MenuBarStore(),
+            permissionService: FakeAccessibilityPermissionService(isTrusted: true),
+            discoveryService: discovery
+        )
+
+        let activeRefresh = Task { @MainActor in
+            await coordinator.refresh()
+        }
+        let clock = ContinuousClock()
+        let activeDeadline = clock.now.advanced(by: .seconds(1))
+        while discovery.discoverCallCount == 0, clock.now < activeDeadline {
+            await Task.yield()
+        }
+        #expect(discovery.discoverCallCount == 1)
+        var queuedRefreshDidFinish = false
+        let queuedRefresh = Task { @MainActor in
+            await coordinator.refresh()
+            queuedRefreshDidFinish = true
+        }
+        let waiterDeadline = clock.now.advanced(by: .seconds(1))
+        while coordinator.pendingRefreshCount == 0, clock.now < waiterDeadline {
+            await Task.yield()
+        }
+        #expect(coordinator.pendingRefreshCount == 1)
+
+        coordinator.stop()
+        let completionDeadline = clock.now.advanced(by: .seconds(1))
+        while !queuedRefreshDidFinish, clock.now < completionDeadline {
+            await Task.yield()
+        }
+        let stoppedWithoutWaitingForDiscovery = queuedRefreshDidFinish
+        discovery.resumeFirstDiscovery()
+        await activeRefresh.value
+        await queuedRefresh.value
+
+        #expect(stoppedWithoutWaitingForDiscovery)
+        #expect(coordinator.pendingRefreshCount == 0)
+        #expect(!coordinator.store.isRefreshing)
+    }
+
+    @Test("ログイン起動の登録失敗は逆操作せず実状態とエラーを保持する")
+    func loginItemRegistrationFailureDoesNotRetryOppositeOperation() {
+        let controller = FakeLoginItemController(isEnabled: false, shouldFail: true)
+        let model = LoginItemSettingsModel(controller: controller)
+
+        model.request(true)
+
+        #expect(controller.requests == [true])
+        #expect(!model.isEnabled)
+        #expect(model.errorMessage != nil)
+    }
+
+    @Test("ログイン起動の解除失敗は逆操作せず有効状態へ戻す")
+    func loginItemUnregistrationFailureDoesNotRetryOppositeOperation() {
+        let controller = FakeLoginItemController(isEnabled: true, shouldFail: true)
+        let model = LoginItemSettingsModel(controller: controller)
+
+        model.request(false)
+
+        #expect(controller.requests == [false])
+        #expect(model.isEnabled)
+        #expect(model.errorMessage != nil)
+    }
+
+    @Test("ログイン起動の変更成功は実状態を反映して以前のエラーを消す")
+    func loginItemSuccessReflectsServiceStateAndClearsError() {
+        let controller = FakeLoginItemController(isEnabled: false, shouldFail: true)
+        let model = LoginItemSettingsModel(controller: controller)
+        model.request(true)
+        controller.shouldFail = false
+
+        model.request(true)
+
+        #expect(controller.requests == [true, true])
+        #expect(model.isEnabled)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test("ログイン起動に承認が必要なら逆操作せず案内を保持する")
+    func loginItemApprovalRequiredKeepsGuidance() {
+        let controller = FakeLoginItemController(
+            isEnabled: false,
+            shouldFail: true,
+            requiresApproval: true
+        )
+        let model = LoginItemSettingsModel(controller: controller)
+
+        model.request(true)
+
+        #expect(controller.requests == [true])
+        #expect(!model.isEnabled)
+        #expect(model.errorMessage == LoginItemSettingsModel.approvalMessage)
+    }
+
+    @Test("起動時からログイン項目が承認待ちなら専用案内を表示する")
+    func loginItemInitialApprovalStateShowsGuidance() {
+        let controller = FakeLoginItemController(
+            isEnabled: false,
+            shouldFail: false,
+            requiresApproval: true
+        )
+
+        let model = LoginItemSettingsModel(controller: controller)
+
+        #expect(!model.isEnabled)
+        #expect(model.requiresApproval)
+        #expect(model.errorMessage == LoginItemSettingsModel.approvalMessage)
+        #expect(controller.requests.isEmpty)
+    }
+
+    @Test("システム設定での外部変更を再同期し承認案内を消す")
+    func loginItemRefreshReflectsExternalApproval() {
+        let controller = FakeLoginItemController(
+            isEnabled: false,
+            shouldFail: false,
+            requiresApproval: true
+        )
+        let model = LoginItemSettingsModel(controller: controller)
+        controller.requiresApproval = false
+        controller.isEnabled = true
+
+        model.refresh()
+
+        #expect(model.isEnabled)
+        #expect(!model.requiresApproval)
+        #expect(model.errorMessage == nil)
+        #expect(controller.requests.isEmpty)
+    }
+
     @Test("表示変更前に開始した更新結果を破棄し変更後の再取得だけを反映する")
     func discardsRefreshResultSupersededByVisibilityMutation() async {
         let staleItem = makeItem(id: "stale", title: "Stale")
@@ -396,6 +532,32 @@ private final class FakeAccessibilityPermissionService: AccessibilityPermissionP
 
     func openSystemSettings() {}
 }
+
+@MainActor
+private final class FakeLoginItemController: LoginItemControlling {
+    var isEnabled: Bool
+    var shouldFail: Bool
+    var requiresApproval: Bool
+    private(set) var requests: [Bool] = []
+
+    init(
+        isEnabled: Bool,
+        shouldFail: Bool,
+        requiresApproval: Bool = false
+    ) {
+        self.isEnabled = isEnabled
+        self.shouldFail = shouldFail
+        self.requiresApproval = requiresApproval
+    }
+
+    func setEnabled(_ enabled: Bool) throws {
+        requests.append(enabled)
+        if shouldFail { throw FakeLoginItemError() }
+        isEnabled = requiresApproval ? false : enabled
+    }
+}
+
+private struct FakeLoginItemError: Error {}
 
 @MainActor
 private final class FakeMenuBarDiscoveryService: MenuBarDiscovering {

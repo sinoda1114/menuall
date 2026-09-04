@@ -213,6 +213,9 @@ final class MenuBarRefreshCoordinator: NSObject {
     private var visibilityMutationDepth = 0
     private var needsRefresh = false
     private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isStopped = false
+
+    var pendingRefreshCount: Int { refreshWaiters.count }
 
     init(
         store: MenuBarStore,
@@ -232,6 +235,7 @@ final class MenuBarRefreshCoordinator: NSObject {
 
     func start() {
         guard periodicTask == nil else { return }
+        isStopped = false
 
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
@@ -265,10 +269,14 @@ final class MenuBarRefreshCoordinator: NSObject {
     }
 
     func stop() {
+        isStopped = true
         periodicTask?.cancel()
         periodicTask = nil
         refreshGeneration &+= 1
         needsRefresh = false
+        let waiters = refreshWaiters
+        refreshWaiters.removeAll()
+        waiters.forEach { $0.resume() }
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.forEach(center.removeObserver)
         workspaceObservers.removeAll()
@@ -292,6 +300,7 @@ final class MenuBarRefreshCoordinator: NSObject {
     }
 
     func refresh() async {
+        guard !isStopped else { return }
         let trusted = permissionService.isTrusted
         updateAccessibilityTrust(trusted)
         guard trusted else {
@@ -326,6 +335,7 @@ final class MenuBarRefreshCoordinator: NSObject {
             needsRefresh = false
             let generation = refreshGeneration
             let result = await discoveryService.discover()
+            guard !isStopped else { return }
             let remainsTrusted = permissionService.isTrusted
             updateAccessibilityTrust(remainsTrusted)
 
