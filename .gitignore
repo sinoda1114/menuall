@@ -1,0 +1,34 @@
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+
+# Build products
+build/
+DerivedData/
+.derived*/
+.ui-attachments*/
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.profraw
+*.profdata
+*.xcresult
+*.xcarchive
+
+# Local test evidence
+docs/evidence/
+
+# Signing and local environment secrets
+*.p8
+*.p12
+*.key
+.env
+.env.*
+!.env.example
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
