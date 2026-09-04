@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import Testing
 @testable import MenuAll
 
@@ -32,8 +33,8 @@ struct WindowServerMenuBarItemMatcherTests {
         #expect(result == .matched(expected))
     }
 
-    @Test("AXのボタン枠を内包するstatus windowを照合する")
-    func matchesContainingStatusWindow() {
+    @Test("所有者identityがないscore 0のstatus windowは照合しない")
+    func rejectsContainingStatusWindowWithoutOwnerIdentity() {
         let item = AccessibilityMenuBarItemDescriptor(
             itemID: "contained",
             ownerPID: 42,
@@ -52,7 +53,179 @@ struct WindowServerMenuBarItemMatcherTests {
             frame: CGRect(x: 493, y: 0, width: 38, height: 30)
         )
 
+        #expect(
+            matcher.match(item: item, among: [expected])
+                == .unsupported(reason: "対応するメニューバー項目を特定できません。")
+        )
+    }
+
+    @Test("検証済みOSホストがbundle名で代理所有するstatus windowを照合する")
+    func matchesTrustedSystemHostProxy() {
+        let item = AccessibilityMenuBarItemDescriptor(
+            itemID: "proxied",
+            ownerPID: 42,
+            ownerName: "Example",
+            bundleIdentifier: "com.example.Menu",
+            title: "Example",
+            frame: CGRect(x: 500, y: 3, width: 24, height: 24)
+        )
+        let expected = WindowServerMenuBarItemDescriptor(
+            windowID: 11,
+            ownerPID: 900,
+            ownerName: "Control Center",
+            ownerBundleIdentifier: "com.apple.controlcenter",
+            windowName: "com.example.Menu",
+            layer: Int(CGWindowLevelForKey(.statusWindow)),
+            frame: CGRect(x: 493, y: 0, width: 38, height: 30),
+            isTrustedSystemMenuBarHost: true
+        )
+
         #expect(matcher.match(item: item, among: [expected]) == .matched(expected))
+    }
+
+    @Test("OSホストを自己申告するだけのwindowは代理照合しない")
+    func rejectsUntrustedSystemHostProxyClaim() {
+        let item = accessibilityItem()
+        let claimedProxy = WindowServerMenuBarItemDescriptor(
+            windowID: 11,
+            ownerPID: 900,
+            ownerName: "Control Center",
+            ownerBundleIdentifier: "com.apple.controlcenter",
+            windowName: "com.example.Menu",
+            layer: Int(CGWindowLevelForKey(.statusWindow)),
+            frame: CGRect(x: 500, y: 0, width: 28, height: 24)
+        )
+
+        #expect(
+            matcher.match(item: item, among: [claimedProxy])
+                == .unsupported(reason: "対応するメニューバー項目を特定できません。")
+        )
+    }
+
+    @Test("既知bundle IDでもSystem実行ファイルでなければ信頼しない")
+    func requiresProtectedSystemExecutableForHostTrust() {
+        #expect(
+            !SystemMenuBarHostTrust.isTrusted(
+                bundleIdentifier: "com.apple.controlcenter",
+                executableURL: URL(fileURLWithPath: "/tmp/ControlCenter.app/Contents/MacOS/ControlCenter"),
+                hasValidAppleSignature: true
+            )
+        )
+        #expect(
+            SystemMenuBarHostTrust.isTrusted(
+                bundleIdentifier: "com.apple.controlcenter",
+                executableURL: URL(
+                    fileURLWithPath: "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+                ),
+                hasValidAppleSignature: true
+            )
+        )
+        #expect(
+            !SystemMenuBarHostTrust.isTrusted(
+                bundleIdentifier: "com.apple.controlcenter",
+                executableURL: URL(
+                    fileURLWithPath: "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+                ),
+                hasValidAppleSignature: false
+            )
+        )
+    }
+
+    @Test("既知OSホストでない場合は署名検証を実行しない")
+    func skipsSignatureValidationBeforeSystemHostPreflightPasses() {
+        var signatureValidationCount = 0
+        let validateSignature = {
+            signatureValidationCount += 1
+            return true
+        }
+
+        let untrustedResult = SystemMenuBarHostTrust.isTrusted(
+            bundleIdentifier: "com.example.Menu",
+            executableURL: URL(fileURLWithPath: "/Applications/Example.app/Contents/MacOS/Example"),
+            hasValidAppleSignature: validateSignature()
+        )
+        #expect(!untrustedResult)
+        #expect(signatureValidationCount == 0)
+
+        let wrongPathResult = SystemMenuBarHostTrust.isTrusted(
+            bundleIdentifier: "com.apple.controlcenter",
+            executableURL: URL(fileURLWithPath: "/Applications/ControlCenter"),
+            hasValidAppleSignature: validateSignature()
+        )
+        #expect(!wrongPathResult)
+        #expect(signatureValidationCount == 0)
+
+        let trustedResult = SystemMenuBarHostTrust.isTrusted(
+            bundleIdentifier: "com.apple.controlcenter",
+            executableURL: URL(
+                fileURLWithPath: "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+            ),
+            hasValidAppleSignature: validateSignature()
+        )
+        #expect(trustedResult)
+        #expect(signatureValidationCount == 1)
+    }
+
+    @Test("代理window名はbundle IDと大文字小文字を含め完全一致させる")
+    func rejectsCaseMismatchedProxyWindowName() {
+        let item = accessibilityItem()
+        let proxy = WindowServerMenuBarItemDescriptor(
+            windowID: 11,
+            ownerPID: 900,
+            ownerName: "Control Center",
+            ownerBundleIdentifier: "com.apple.controlcenter",
+            windowName: "com.example.menu",
+            layer: Int(CGWindowLevelForKey(.statusWindow)),
+            frame: CGRect(x: 500, y: 0, width: 28, height: 24),
+            isTrustedSystemMenuBarHost: true
+        )
+
+        #expect(
+            matcher.match(item: item, among: [proxy])
+                == .unsupported(reason: "対応するメニューバー項目を特定できません。")
+        )
+    }
+
+    @Test("不正なbundle IDは検証済みOSホストでも代理照合しない")
+    func rejectsMalformedBundleIdentifierForProxy() {
+        let item = AccessibilityMenuBarItemDescriptor(
+            itemID: "malformed",
+            ownerPID: 42,
+            ownerName: "Example",
+            bundleIdentifier: "com.example.Menu\" or anchor apple",
+            title: "Example",
+            frame: CGRect(x: 500, y: 0, width: 28, height: 24)
+        )
+        let proxy = WindowServerMenuBarItemDescriptor(
+            windowID: 11,
+            ownerPID: 900,
+            ownerName: "Control Center",
+            ownerBundleIdentifier: "com.apple.controlcenter",
+            windowName: item.bundleIdentifier,
+            layer: Int(CGWindowLevelForKey(.statusWindow)),
+            frame: CGRect(x: 500, y: 0, width: 28, height: 24),
+            isTrustedSystemMenuBarHost: true
+        )
+
+        #expect(
+            matcher.match(item: item, among: [proxy])
+                == .unsupported(reason: "対応するメニューバー項目を特定できません。")
+        )
+    }
+
+    @Test("同じPIDでもbundle IDが不一致ならstale windowとして拒否する")
+    func rejectsSamePIDWithConflictingBundleIdentifiers() {
+        let item = accessibilityItem()
+        let staleWindow = windowItem(
+            ownerPID: item.ownerPID,
+            ownerName: "Example",
+            ownerBundleIdentifier: "com.example.ReusedPID"
+        )
+
+        #expect(
+            matcher.match(item: item, among: [staleWindow])
+                == .unsupported(reason: "対応するメニューバー項目を特定できません。")
+        )
     }
 
     @Test("同じ強さの候補が複数ある場合は曖昧として拒否する")

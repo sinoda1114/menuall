@@ -7,6 +7,7 @@ import Foundation
 final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointResolving {
     private let sectionController: MenuBarSectionController
     private let windowProvider: any WindowServerMenuBarItemDescriptorProviding
+    private let applicationIdentityProvider: any RunningApplicationIdentityProviding
     private let matcher: WindowServerMenuBarItemMatcher
     private var itemsByID: [String: MenuBarItemSnapshot] = [:]
     /// Window IDはWindowServerにより再利用されるため、IDだけでは対象を信用しない。
@@ -17,10 +18,12 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
     init(
         sectionController: MenuBarSectionController,
         windowProvider: any WindowServerMenuBarItemDescriptorProviding = WindowServerMenuBarItemDescriptorProvider(),
+        applicationIdentityProvider: any RunningApplicationIdentityProviding = WorkspaceRunningApplicationIdentityProvider(),
         matcher: WindowServerMenuBarItemMatcher = .init(frameTolerance: 1)
     ) {
         self.sectionController = sectionController
         self.windowProvider = windowProvider
+        self.applicationIdentityProvider = applicationIdentityProvider
         self.matcher = matcher
     }
 
@@ -42,8 +45,13 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
     func availabilitySnapshot() -> [String: VisibilityControlAvailability] {
         sectionController.refreshAvailability()
         let windows = windowProvider.descriptors()
+        let applicationIdentitySnapshot = applicationIdentityProvider.identitySnapshot()
         return itemsByID.reduce(into: [:]) { result, entry in
-            result[entry.key] = evaluateAvailability(for: entry.value, windows: windows)
+            result[entry.key] = evaluateAvailability(
+                for: entry.value,
+                windows: windows,
+                applicationIdentitySnapshot: applicationIdentitySnapshot
+            )
         }
     }
 
@@ -57,7 +65,8 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
 
     private func evaluateAvailability(
         for item: MenuBarItemSnapshot,
-        windows: [WindowServerMenuBarItemDescriptor]
+        windows: [WindowServerMenuBarItemDescriptor],
+        applicationIdentitySnapshot: RunningApplicationIdentitySnapshot? = nil
     ) -> VisibilityControlAvailability {
         if let conflict = sectionController.conflicts.first {
             return .unavailable(
@@ -75,7 +84,11 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
             return .unavailable(reason: "表示・非表示の境界を特定できません。")
         }
 
-        switch resolveOperationalWindow(for: item, windows: windows) {
+        switch resolveOperationalWindow(
+            for: item,
+            windows: windows,
+            applicationIdentitySnapshot: applicationIdentitySnapshot
+        ) {
         case let .matched(window):
             if item.visibility == .hidden,
                window.displayID == nil,
@@ -204,7 +217,8 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
     /// 同一アプリの別項目へイベントを送ることを防ぐ。
     private func resolveOperationalWindow(
         for item: MenuBarItemSnapshot,
-        windows: [WindowServerMenuBarItemDescriptor]
+        windows: [WindowServerMenuBarItemDescriptor],
+        applicationIdentitySnapshot: RunningApplicationIdentitySnapshot? = nil
     ) -> WindowServerMenuBarItemMatch {
         let candidates = windows.filter { $0.windowID != sectionController.boundaryWindowID }
         let frameMatch = resolveWindow(for: item, windows: candidates)
@@ -215,15 +229,23 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
 
         guard let cachedWindow = matchedWindows[item.id] else {
             if case let .matched(window) = frameMatch,
-               hasInitialIdentity(window, for: item) {
+               hasInitialIdentity(
+                   window,
+                   for: item,
+                   applicationIdentitySnapshot: applicationIdentitySnapshot
+               ) {
                 return .matched(window)
             }
             if let bundleIdentifier = item.bundleIdentifier {
                 let sameBundleItemCount = itemsByID.values.filter {
-                    equalsIgnoringCase($0.bundleIdentifier, bundleIdentifier)
+                    $0.bundleIdentifier == bundleIdentifier
                 }.count
                 let primaryCandidates = candidates.filter {
-                    equalsIgnoringCase($0.windowName, bundleIdentifier)
+                    hasTrustedSystemHostProxyIdentity(
+                        $0,
+                        for: item,
+                        applicationIdentitySnapshot: applicationIdentitySnapshot
+                    )
                 }
                 if sameBundleItemCount == 1,
                    primaryCandidates.count == 1,
@@ -242,7 +264,12 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
 
         if let currentWindow = candidates.first(where: {
             $0.windowID == cachedWindow.windowID
-        }), hasSameStableWindowProperties(currentWindow, as: cachedWindow) {
+        }), hasSameStableWindowProperties(currentWindow, as: cachedWindow),
+           hasInitialIdentity(
+               currentWindow,
+               for: item,
+               applicationIdentitySnapshot: applicationIdentitySnapshot
+           ) {
             let frameStillIdentifiesCachedWindow: Bool
             if case let .matched(window) = frameMatch {
                 frameStillIdentifiesCachedWindow = window.windowID == currentWindow.windowID
@@ -251,12 +278,22 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
             }
             if frameStillIdentifiesCachedWindow
                 || currentWindow.frame == cachedWindow.frame
-                || (isLayoutTransactionActive && hasRebindIdentity(currentWindow, for: item)) {
+                || (isLayoutTransactionActive && hasRebindIdentity(
+                    currentWindow,
+                    for: item,
+                    applicationIdentitySnapshot: applicationIdentitySnapshot
+                )) {
                 return .matched(currentWindow)
             }
         }
 
-        let rebindCandidates = candidates.filter { hasRebindIdentity($0, for: item) }
+        let rebindCandidates = candidates.filter {
+            hasRebindIdentity(
+                $0,
+                for: item,
+                applicationIdentitySnapshot: applicationIdentitySnapshot
+            )
+        }
         if rebindCandidates.count == 1, let match = rebindCandidates.first {
             return .matched(match)
         }
@@ -272,19 +309,43 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
 
     private func hasInitialIdentity(
         _ window: WindowServerMenuBarItemDescriptor,
-        for item: MenuBarItemSnapshot
+        for item: MenuBarItemSnapshot,
+        applicationIdentitySnapshot: RunningApplicationIdentitySnapshot? = nil
     ) -> Bool {
-        if window.ownerPID == item.ownerPID { return true }
-        if let bundleIdentifier = item.bundleIdentifier,
-           equalsIgnoringCase(window.ownerBundleIdentifier, bundleIdentifier) {
+        if window.ownerPID == item.ownerPID {
+            if let itemBundleIdentifier = item.bundleIdentifier,
+               let windowBundleIdentifier = window.ownerBundleIdentifier {
+                return itemBundleIdentifier == windowBundleIdentifier
+            }
             return true
         }
-        return item.bundleIdentifier.map { equalsIgnoringCase(window.windowName, $0) } ?? false
+        return hasTrustedSystemHostProxyIdentity(
+            window,
+            for: item,
+            applicationIdentitySnapshot: applicationIdentitySnapshot
+        )
+    }
+
+    private func hasTrustedSystemHostProxyIdentity(
+        _ window: WindowServerMenuBarItemDescriptor,
+        for item: MenuBarItemSnapshot,
+        applicationIdentitySnapshot: RunningApplicationIdentitySnapshot? = nil
+    ) -> Bool {
+        guard window.isTrustedSystemMenuBarHost,
+              let bundleIdentifier = item.bundleIdentifier,
+              BundleIdentifierSyntax.isValid(bundleIdentifier),
+              window.windowName == bundleIdentifier
+        else { return false }
+        let sourceOwnerPIDs = applicationIdentitySnapshot?
+            .ownerPIDs(forBundleIdentifier: bundleIdentifier)
+            ?? applicationIdentityProvider.ownerPIDs(forBundleIdentifier: bundleIdentifier)
+        return sourceOwnerPIDs == Set([item.ownerPID])
     }
 
     private func hasRebindIdentity(
         _ window: WindowServerMenuBarItemDescriptor,
-        for item: MenuBarItemSnapshot
+        for item: MenuBarItemSnapshot,
+        applicationIdentitySnapshot: RunningApplicationIdentitySnapshot? = nil
     ) -> Bool {
         guard item.hasExplicitName else { return false }
         let sameNamedItemCount = itemsByID.values.filter {
@@ -294,6 +355,11 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
         }.count
         if sameNamedItemCount == 1,
            window.ownerPID == item.ownerPID,
+           hasInitialIdentity(
+               window,
+               for: item,
+               applicationIdentitySnapshot: applicationIdentitySnapshot
+           ),
            normalized(window.windowName) == normalized(item.title),
            normalized(item.title) != nil {
             return true
@@ -308,10 +374,7 @@ final class LiveMenuBarVisibilityEndpointResolver: MenuBarVisibilityEndpointReso
         current.ownerPID == cached.ownerPID
             && normalized(current.ownerBundleIdentifier) == normalized(cached.ownerBundleIdentifier)
             && normalized(current.windowName) == normalized(cached.windowName)
-    }
-
-    private func equalsIgnoringCase(_ lhs: String?, _ rhs: String) -> Bool {
-        lhs?.caseInsensitiveCompare(rhs) == .orderedSame
+            && current.isTrustedSystemMenuBarHost == cached.isTrustedSystemMenuBarHost
     }
 
     private func normalized(_ value: String?) -> String? {

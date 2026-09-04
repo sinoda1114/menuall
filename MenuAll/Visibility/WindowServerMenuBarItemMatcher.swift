@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import Security
 
 struct AccessibilityMenuBarItemDescriptor: Equatable, Sendable {
     let itemID: String
@@ -20,6 +21,7 @@ struct WindowServerMenuBarItemDescriptor: Equatable, Sendable {
     let layer: Int
     let frame: CGRect
     let displayID: CGDirectDisplayID?
+    let isTrustedSystemMenuBarHost: Bool
 
     init(
         windowID: CGWindowID,
@@ -29,7 +31,8 @@ struct WindowServerMenuBarItemDescriptor: Equatable, Sendable {
         windowName: String?,
         layer: Int,
         frame: CGRect,
-        displayID: CGDirectDisplayID? = nil
+        displayID: CGDirectDisplayID? = nil,
+        isTrustedSystemMenuBarHost: Bool = false
     ) {
         self.windowID = windowID
         self.ownerPID = ownerPID
@@ -39,6 +42,7 @@ struct WindowServerMenuBarItemDescriptor: Equatable, Sendable {
         self.layer = layer
         self.frame = frame
         self.displayID = displayID
+        self.isTrustedSystemMenuBarHost = isTrustedSystemMenuBarHost
     }
 }
 
@@ -67,7 +71,9 @@ struct WindowServerMenuBarItemMatcher: Sendable {
         }
 
         let scoredCandidates = windows.compactMap { window -> (WindowServerMenuBarItemDescriptor, Int)? in
-            guard framesMatch(frame, window.frame) else { return nil }
+            guard framesMatch(frame, window.frame),
+                  isEligibleIdentity(item: item, window: window)
+            else { return nil }
             return (window, identityScore(item: item, window: window))
         }
         guard !scoredCandidates.isEmpty else {
@@ -112,7 +118,39 @@ struct WindowServerMenuBarItemMatcher: Sendable {
         if normalized(item.title) == normalized(window.windowName), normalized(item.title) != nil {
             score += 1
         }
+        if systemHostProxyMatches(item: item, window: window) { score += 8 }
         return score
+    }
+
+    private func isEligibleIdentity(
+        item: AccessibilityMenuBarItemDescriptor,
+        window: WindowServerMenuBarItemDescriptor
+    ) -> Bool {
+        sameProcessIdentityMatches(item: item, window: window)
+            || systemHostProxyMatches(item: item, window: window)
+    }
+
+    private func sameProcessIdentityMatches(
+        item: AccessibilityMenuBarItemDescriptor,
+        window: WindowServerMenuBarItemDescriptor
+    ) -> Bool {
+        guard item.ownerPID == window.ownerPID else { return false }
+        if let itemBundleIdentifier = item.bundleIdentifier,
+           let windowBundleIdentifier = window.ownerBundleIdentifier {
+            return itemBundleIdentifier == windowBundleIdentifier
+        }
+        return true
+    }
+
+    private func systemHostProxyMatches(
+        item: AccessibilityMenuBarItemDescriptor,
+        window: WindowServerMenuBarItemDescriptor
+    ) -> Bool {
+        guard window.isTrustedSystemMenuBarHost,
+              let bundleIdentifier = item.bundleIdentifier,
+              BundleIdentifierSyntax.isValid(bundleIdentifier)
+        else { return false }
+        return window.windowName == bundleIdentifier
     }
 
     private func isFixedAppleItem(_ item: AccessibilityMenuBarItemDescriptor) -> Bool {
@@ -133,6 +171,132 @@ struct WindowServerMenuBarItemMatcher: Sendable {
 protocol WindowServerMenuBarItemDescriptorProviding {
     func descriptors() -> [WindowServerMenuBarItemDescriptor]
     func activeDisplayIDs() -> Set<CGDirectDisplayID>
+}
+
+enum BundleIdentifierSyntax {
+    static func isValid(_ value: String) -> Bool {
+        guard value.unicodeScalars.count <= 255 else { return false }
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count >= 2 else { return false }
+
+        return components.allSatisfy { component in
+            guard !component.isEmpty,
+                  component.unicodeScalars.count <= 63,
+                  let first = component.unicodeScalars.first,
+                  let last = component.unicodeScalars.last,
+                  isASCIIAlphanumeric(first),
+                  isASCIIAlphanumeric(last)
+            else { return false }
+            return component.unicodeScalars.allSatisfy {
+                isASCIIAlphanumeric($0) || $0.value == 0x2D
+            }
+        }
+    }
+
+    private static func isASCIIAlphanumeric(_ scalar: Unicode.Scalar) -> Bool {
+        (0x30...0x39).contains(scalar.value)
+            || (0x41...0x5A).contains(scalar.value)
+            || (0x61...0x7A).contains(scalar.value)
+    }
+}
+
+enum SystemMenuBarHostTrust {
+    static func isTrusted(
+        bundleIdentifier: String?,
+        executableURL: URL?,
+        hasValidAppleSignature: @autoclosure () -> Bool
+    ) -> Bool {
+        guard let bundleIdentifier = bundleIdentifier?.lowercased(),
+              let executablePath = executableURL?
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+        else { return false }
+
+        let hasKnownSystemIdentity = switch bundleIdentifier {
+        case "com.apple.controlcenter":
+            executablePath
+                == "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+        case "com.apple.systemuiserver":
+            executablePath
+                == "/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer"
+        default:
+            false
+        }
+        guard hasKnownSystemIdentity else { return false }
+        return hasValidAppleSignature()
+    }
+}
+
+enum SystemProcessCodeSignatureTrust {
+    static func isAppleSigned(
+        pid: pid_t,
+        bundleIdentifier: String
+    ) -> Bool {
+        guard BundleIdentifierSyntax.isValid(bundleIdentifier) else { return false }
+
+        let attributes = [
+            kSecGuestAttributePid as String: NSNumber(value: pid)
+        ] as CFDictionary
+        var code: SecCode?
+        guard SecCodeCopyGuestWithAttributes(
+            nil,
+            attributes,
+            SecCSFlags(rawValue: 0),
+            &code
+        ) == errSecSuccess,
+        let code
+        else { return false }
+
+        var requirement: SecRequirement?
+        let requirementText = "anchor apple and identifier \"\(bundleIdentifier)\"" as CFString
+        guard SecRequirementCreateWithString(
+            requirementText,
+            SecCSFlags(rawValue: 0),
+            &requirement
+        ) == errSecSuccess,
+        let requirement
+        else { return false }
+
+        return SecCodeCheckValidity(
+            code,
+            SecCSFlags(rawValue: 0),
+            requirement
+        ) == errSecSuccess
+    }
+}
+
+protocol RunningApplicationIdentityProviding {
+    func ownerPIDs(forBundleIdentifier bundleIdentifier: String) -> Set<pid_t>
+    func identitySnapshot() -> RunningApplicationIdentitySnapshot
+}
+
+struct RunningApplicationIdentitySnapshot: Equatable, Sendable {
+    let pidsByBundleIdentifier: [String: Set<pid_t>]
+
+    func ownerPIDs(forBundleIdentifier bundleIdentifier: String) -> Set<pid_t> {
+        pidsByBundleIdentifier[bundleIdentifier] ?? []
+    }
+}
+
+struct WorkspaceRunningApplicationIdentityProvider: RunningApplicationIdentityProviding {
+    func ownerPIDs(forBundleIdentifier bundleIdentifier: String) -> Set<pid_t> {
+        identitySnapshot().ownerPIDs(forBundleIdentifier: bundleIdentifier)
+    }
+
+    func identitySnapshot() -> RunningApplicationIdentitySnapshot {
+        let pidsByBundleIdentifier = NSWorkspace.shared.runningApplications.reduce(
+            into: [String: Set<pid_t>]()
+        ) { result, application in
+            guard !application.isTerminated,
+                  let bundleIdentifier = application.bundleIdentifier
+            else { return }
+            result[bundleIdentifier, default: []].insert(application.processIdentifier)
+        }
+        return RunningApplicationIdentitySnapshot(
+            pidsByBundleIdentifier: pidsByBundleIdentifier
+        )
+    }
 }
 
 struct WindowServerMenuBarItemDescriptorProvider: WindowServerMenuBarItemDescriptorProviding {
@@ -157,6 +321,7 @@ struct WindowServerMenuBarItemDescriptorProvider: WindowServerMenuBarItemDescrip
 
         let statusLayer = Int(CGWindowLevelForKey(.statusWindow))
         let displayIDs = activeDisplayIDs()
+        var systemHostTrustByPID: [pid_t: Bool] = [:]
         return rawWindows.compactMap { rawWindow in
             guard let layer = (rawWindow[kCGWindowLayer as String] as? NSNumber)?.intValue,
                   layer == statusLayer,
@@ -174,6 +339,19 @@ struct WindowServerMenuBarItemDescriptorProvider: WindowServerMenuBarItemDescrip
             let frame = CGRect(x: x, y: y, width: width, height: height)
 
             let application = NSRunningApplication(processIdentifier: ownerPID)
+            let systemHostTrust = systemHostTrustByPID[ownerPID] ?? {
+                guard let bundleIdentifier = application?.bundleIdentifier else { return false }
+                let isTrusted = SystemMenuBarHostTrust.isTrusted(
+                    bundleIdentifier: bundleIdentifier,
+                    executableURL: application?.executableURL,
+                    hasValidAppleSignature: SystemProcessCodeSignatureTrust.isAppleSigned(
+                        pid: ownerPID,
+                        bundleIdentifier: bundleIdentifier
+                    )
+                )
+                systemHostTrustByPID[ownerPID] = isTrusted
+                return isTrusted
+            }()
             return WindowServerMenuBarItemDescriptor(
                 windowID: windowID,
                 ownerPID: ownerPID,
@@ -188,7 +366,8 @@ struct WindowServerMenuBarItemDescriptorProvider: WindowServerMenuBarItemDescrip
                 ),
                 layer: layer,
                 frame: frame,
-                displayID: displayID(containing: frame, among: displayIDs)
+                displayID: displayID(containing: frame, among: displayIDs),
+                isTrustedSystemMenuBarHost: systemHostTrust
             )
         }
     }

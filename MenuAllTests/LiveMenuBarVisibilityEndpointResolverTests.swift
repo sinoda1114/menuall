@@ -17,6 +17,119 @@ struct LiveMenuBarVisibilityEndpointResolverTests {
         #expect(resolver.observedVisibility(itemID: "item") == .visible)
     }
 
+    @Test("同一bundle IDを名乗る別PIDの偽snapshotを通常windowへ結合しない")
+    func rejectsSpoofedSnapshotWithSameBundleIdentifierFromDifferentPID() {
+        let victimWindow = itemWindow(windowName: "Example")
+            .replacingOwner(pid: 42, bundleIdentifier: "com.example.Menu")
+        let provider = ResolverWindowProvider(windows: [victimWindow, boundaryWindow()])
+        let resolver = makeResolver(
+            provider: provider,
+            applicationPIDsByBundleIdentifier: ["com.example.Menu": [42, 84]]
+        )
+        let spoofedSnapshot = MenuBarItemSnapshot(
+            id: "spoofed-item",
+            ownerPID: 84,
+            ownerName: "Spoofed",
+            bundleIdentifier: "com.example.Menu",
+            title: "Example",
+            visibility: .visible,
+            frame: CGRect(x: 500, y: 3, width: 24, height: 24)
+        )
+
+        resolver.update(items: [spoofedSnapshot])
+
+        #expect(resolver.availability(for: spoofedSnapshot.id) != .available)
+        #expect(resolver.endpoint(for: spoofedSnapshot.id) == nil)
+    }
+
+    @Test("frame不一致fallbackでも未検証の別PID primary windowへ結合しない")
+    func rejectsUntrustedCrossPIDPrimaryFallback() {
+        let untrustedPrimary = itemWindow(
+            windowID: 12,
+            frame: CGRect(x: 300, y: 0, width: 38, height: 30)
+        ).replacingOwner(pid: 84, bundleIdentifier: "com.example.Menu")
+        let provider = ResolverWindowProvider(windows: [untrustedPrimary, boundaryWindow()])
+        let resolver = makeResolver(
+            provider: provider,
+            applicationPIDsByBundleIdentifier: ["com.example.Menu": [42, 84]]
+        )
+        resolver.update(items: [snapshot()])
+
+        #expect(resolver.availability(for: "item") != .available)
+        #expect(resolver.endpoint(for: "item") == nil)
+    }
+
+    @Test("cache後にsource bundleのPID一意性を失ったら再利用しない")
+    func rejectsCachedSystemHostProxyAfterSourceBundleBecomesAmbiguous() {
+        let provider = ResolverWindowProvider(windows: [itemWindow(), boundaryWindow()])
+        let identityProvider = ResolverApplicationIdentityProvider(
+            pidsByBundleIdentifier: ["com.example.Menu": [42]]
+        )
+        let resolver = makeResolver(
+            provider: provider,
+            applicationIdentityProvider: identityProvider
+        )
+        resolver.update(items: [snapshot()])
+        #expect(resolver.endpoint(for: "item")?.windowID == 10)
+
+        identityProvider.pidsByBundleIdentifier["com.example.Menu"] = [42, 84]
+
+        #expect(resolver.endpoint(for: "item") == nil)
+        #expect(resolver.observedVisibility(itemID: "item") == .unknown)
+        #expect(identityProvider.identitySnapshotCount == 0)
+        #expect(identityProvider.ownerPIDLookupCount == 3)
+    }
+
+    @Test("cache後にOSホスト検証を失ったwindowは再利用しない")
+    func rejectsCachedSystemHostProxyAfterTrustIsLost() {
+        let initial = itemWindow()
+        let provider = ResolverWindowProvider(windows: [initial, boundaryWindow()])
+        let resolver = makeResolver(provider: provider)
+        resolver.update(items: [snapshot()])
+        #expect(resolver.endpoint(for: "item")?.windowID == 10)
+
+        provider.windows = [initial.replacingSystemHostTrust(false), boundaryWindow()]
+
+        #expect(resolver.endpoint(for: "item") == nil)
+        #expect(resolver.observedVisibility(itemID: "item") == .unknown)
+    }
+
+    @Test("一覧の可否評価では起動アプリidentityを一度だけ取得する")
+    func capturesRunningApplicationIdentityOncePerAvailabilitySnapshot() {
+        let secondSnapshot = MenuBarItemSnapshot(
+            id: "second-item",
+            ownerPID: 42,
+            ownerName: "Example",
+            bundleIdentifier: "com.example.Menu",
+            title: "Second",
+            visibility: .visible,
+            frame: CGRect(x: 550, y: 3, width: 24, height: 24)
+        )
+        let provider = ResolverWindowProvider(windows: [
+            itemWindow(),
+            itemWindow(
+                windowID: 11,
+                frame: CGRect(x: 543, y: 0, width: 38, height: 30)
+            ),
+            boundaryWindow()
+        ])
+        let identityProvider = ResolverApplicationIdentityProvider(
+            pidsByBundleIdentifier: ["com.example.Menu": [42]]
+        )
+        let resolver = makeResolver(
+            provider: provider,
+            applicationIdentityProvider: identityProvider
+        )
+        resolver.update(items: [snapshot(), secondSnapshot])
+
+        let availability = resolver.availabilitySnapshot()
+
+        #expect(availability["item"] == .available)
+        #expect(availability["second-item"] == .available)
+        #expect(identityProvider.identitySnapshotCount == 1)
+        #expect(identityProvider.ownerPIDLookupCount == 0)
+    }
+
     @Test("変更後は同じwindow IDの位置を再観測する")
     func observesCachedWindowAfterMovement() {
         let initial = itemWindow(windowName: "Example")
@@ -441,7 +554,11 @@ struct LiveMenuBarVisibilityEndpointResolverTests {
     }
 
     private func makeResolver(
-        provider: ResolverWindowProvider
+        provider: ResolverWindowProvider,
+        applicationIdentityProvider: (any RunningApplicationIdentityProviding)? = nil,
+        applicationPIDsByBundleIdentifier: [String: Set<pid_t>] = [
+            "com.example.Menu": [42]
+        ]
     ) -> LiveMenuBarVisibilityEndpointResolver {
         let section = MenuBarSectionController(
             conflictDetector: ResolverConflictDetector(conflicts: []),
@@ -449,7 +566,11 @@ struct LiveMenuBarVisibilityEndpointResolverTests {
         )
         return LiveMenuBarVisibilityEndpointResolver(
             sectionController: section,
-            windowProvider: provider
+            windowProvider: provider,
+            applicationIdentityProvider: applicationIdentityProvider
+                ?? ResolverApplicationIdentityProvider(
+                    pidsByBundleIdentifier: applicationPIDsByBundleIdentifier
+                )
         )
     }
 
@@ -482,7 +603,8 @@ struct LiveMenuBarVisibilityEndpointResolverTests {
             windowName: windowName,
             layer: Int(CGWindowLevelForKey(.statusWindow)),
             frame: frame,
-            displayID: displayID
+            displayID: displayID,
+            isTrustedSystemMenuBarHost: true
         )
     }
 
@@ -498,6 +620,28 @@ struct LiveMenuBarVisibilityEndpointResolverTests {
             layer: Int(CGWindowLevelForKey(.statusWindow)),
             frame: CGRect(x: 400, y: 0, width: 40, height: 30),
             displayID: displayID
+        )
+    }
+}
+
+private final class ResolverApplicationIdentityProvider: RunningApplicationIdentityProviding {
+    var pidsByBundleIdentifier: [String: Set<pid_t>]
+    private(set) var ownerPIDLookupCount = 0
+    private(set) var identitySnapshotCount = 0
+
+    init(pidsByBundleIdentifier: [String: Set<pid_t>]) {
+        self.pidsByBundleIdentifier = pidsByBundleIdentifier
+    }
+
+    func ownerPIDs(forBundleIdentifier bundleIdentifier: String) -> Set<pid_t> {
+        ownerPIDLookupCount += 1
+        return pidsByBundleIdentifier[bundleIdentifier] ?? []
+    }
+
+    func identitySnapshot() -> RunningApplicationIdentitySnapshot {
+        identitySnapshotCount += 1
+        return RunningApplicationIdentitySnapshot(
+            pidsByBundleIdentifier: pidsByBundleIdentifier
         )
     }
 }
@@ -562,7 +706,8 @@ private extension WindowServerMenuBarItemDescriptor {
             windowName: windowName,
             layer: layer,
             frame: frame,
-            displayID: displayID
+            displayID: displayID,
+            isTrustedSystemMenuBarHost: false
         )
     }
 
@@ -575,7 +720,22 @@ private extension WindowServerMenuBarItemDescriptor {
             windowName: windowName,
             layer: layer,
             frame: frame,
-            displayID: displayID
+            displayID: displayID,
+            isTrustedSystemMenuBarHost: isTrustedSystemMenuBarHost
+        )
+    }
+
+    func replacingSystemHostTrust(_ isTrusted: Bool) -> WindowServerMenuBarItemDescriptor {
+        WindowServerMenuBarItemDescriptor(
+            windowID: windowID,
+            ownerPID: ownerPID,
+            ownerName: ownerName,
+            ownerBundleIdentifier: ownerBundleIdentifier,
+            windowName: windowName,
+            layer: layer,
+            frame: frame,
+            displayID: displayID,
+            isTrustedSystemMenuBarHost: isTrusted
         )
     }
 }
